@@ -6,18 +6,25 @@
 #
 # For commercial licensing, contact sales@digicert.com.
 
-# Docker Compose for mtc-bridge with PostgreSQL state store.
+# Docker Compose for mtc-bridge in STANDALONE mode (no DigiCert CA).
 #
-# The DigiCert CA MariaDB is assumed to be running separately on its own
-# Docker network (digicert-ca_default). This compose file provides:
-#   - mtc-bridge service
-#   - PostgreSQL 16 state store
+# This compose file runs the bridge using only the local CA: ACME issuance,
+# Merkle tree, visualizer, and proof endpoints all work end-to-end without
+# any DigiCert dependency. New certs are appended to the issuance log
+# directly by the ACME finalize handler (acme/finalize.go:184).
+#
+# Prereqs (run once):
+#   make generate-key            # cosigner Ed25519 key
+#   make generate-local-ca       # local CA key + cert
+#   ./gen-demo-cert.sh           # ACME server TLS cert
 #
 # Usage:
 #   docker compose up -d
 #   docker compose logs -f mtc-bridge
+#
+# To re-enable DigiCert CA polling: set MTC_CADB_HOST/USERNAME/PASSWORD in
+# .env and add `digicert-ca_default` external network back to both services.
 services:
-  # PostgreSQL state store for mtc-bridge
   postgres:
     image: postgres:16-alpine
     environment:
@@ -36,7 +43,6 @@ services:
     networks:
       - mtc-internal
 
-  # MTC Bridge service
   mtc-bridge:
     build: .
     depends_on:
@@ -48,11 +54,8 @@ services:
       MTC_STATE_DB_USERNAME: mtcbridge
       MTC_STATE_DB_PASSWORD: ${MTC_POSTGRES_PASSWORD:-mtcbridge}
       MTC_STATE_DB_DATABASE: mtcbridge
-      MTC_CADB_HOST: ${MTC_CADB_HOST:-ca-db}
-      MTC_CADB_PORT: ${MTC_CADB_PORT:-3306}
-      MTC_CADB_USERNAME: ${MTC_CADB_USERNAME:?MTC_CADB_USERNAME required}
-      MTC_CADB_PASSWORD: ${MTC_CADB_PASSWORD:?MTC_CADB_PASSWORD required}
-      MTC_CADB_DATABASE: ${MTC_CADB_DATABASE:-digicert_ca}
+      # CADB intentionally unset — bridge runs in standalone mode.
+      MTC_CADB_HOST: ""
       MTC_COSIGNER_KEY_FILE: /etc/mtc-bridge/keys/cosigner.key
       MTC_LOCAL_CA_KEY: /etc/mtc-bridge/keys/local-ca.key
       MTC_LOCAL_CA_CERT: /etc/mtc-bridge/keys/local-ca.pem
@@ -63,56 +66,14 @@ services:
       - ./acme-key.pem:/etc/mtc-bridge/acme-key.pem:ro
     ports:
       - "${MTC_HTTP_PORT:-8080}:8080"
-    networks:
-      - mtc-internal
-      - digicert-ca_default
-    restart: unless-stopped
-
-  # ACME server (standalone)
-  acme-server:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      MTC_STATE_DB_HOST: postgres
-      MTC_STATE_DB_PORT: "5432"
-      MTC_STATE_DB_USERNAME: mtcbridge
-      MTC_STATE_DB_PASSWORD: ${MTC_POSTGRES_PASSWORD:-mtcbridge}
-      MTC_STATE_DB_DATABASE: mtcbridge
-      MTC_CADB_HOST: ${MTC_CADB_HOST:-ca-db}
-      MTC_CADB_PORT: ${MTC_CADB_PORT:-3306}
-      MTC_CADB_USERNAME: ${MTC_CADB_USERNAME:?MTC_CADB_USERNAME required}
-      MTC_CADB_PASSWORD: ${MTC_CADB_PASSWORD:?MTC_CADB_PASSWORD required}
-      MTC_CADB_DATABASE: ${MTC_CADB_DATABASE:-digicert_ca}
-      CA_API_KEY: ${CA_API_KEY}
-      CA_ID: ${CA_ID}
-      CA_TEMPLATE_ID: ${CA_TEMPLATE_ID}
-      CA_URL: ${CA_URL:-http://localhost}
-      MTC_BRIDGE_URL: http://mtc-bridge:8080
-      MTC_COSIGNER_KEY_FILE: /etc/mtc-bridge/keys/cosigner.key
-      MTC_LOCAL_CA_KEY: /etc/mtc-bridge/keys/local-ca.key
-      MTC_LOCAL_CA_CERT: /etc/mtc-bridge/keys/local-ca.pem
-    command: [ "-config", "/etc/mtc-bridge/config.yaml" ]
-    volumes:
-      - ./config.yaml:/etc/mtc-bridge/config.yaml:ro
-      - ./keys:/etc/mtc-bridge/keys:ro
-      - ./acme-cert.pem:/etc/mtc-bridge/acme-cert.pem:ro
-      - ./acme-key.pem:/etc/mtc-bridge/acme-key.pem:ro
-    ports:
       - "8443:8443"
     networks:
       - mtc-internal
-      - digicert-ca_default
     restart: unless-stopped
 
 volumes:
   pgdata:
 
-
 networks:
   mtc-internal:
     driver: bridge
-  # External network where the DigiCert CA MariaDB resides.
-  digicert-ca_default:
-    external: true

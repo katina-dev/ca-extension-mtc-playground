@@ -515,11 +515,11 @@ func (c *Config) Validate() error {
 	if c.StateDB.Username == "" {
 		errs = append(errs, "state_db.username is required")
 	}
-	if c.CADB.Host == "" {
-		errs = append(errs, "ca_db.host is required")
-	}
-	if c.CADB.Username == "" {
-		errs = append(errs, "ca_db.username is required")
+	// CADB is optional: if Host is empty, the bridge runs in standalone mode
+	// (no DigiCert CA polling). Local-CA ACME issuance still works because
+	// finalize.go appends entries directly to the issuance log.
+	if c.CADB.Host != "" && c.CADB.Username == "" {
+		errs = append(errs, "ca_db.username is required when ca_db.host is set")
 	}
 	if c.Cosigner.KeyFile == "" {
 		errs = append(errs, "cosigner.key_file is required")

@@ -175,6 +175,12 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 func (w *Watcher) pollCertificates(ctx context.Context) error {
+	// Standalone mode: no CA database to poll. Local-CA-issued certs are
+	// appended directly via acme/finalize.go.
+	if w.cadb == nil {
+		return nil
+	}
+
 	// Get cursor from store.
 	cursor, err := w.store.GetWatcherCursor(ctx)
 	if err != nil {
@@ -225,6 +231,10 @@ func (w *Watcher) pollCertificates(ctx context.Context) error {
 }
 
 func (w *Watcher) pollRevocations(ctx context.Context) error {
+	if w.cadb == nil {
+		return nil
+	}
+
 	// Fetch ALL revoked certs from the CA database. Deduplication is handled
 	// by store.AddRevocation's ON CONFLICT DO NOTHING, so re-processing
 	// already-known revocations is a no-op. This eliminates the previous 24h

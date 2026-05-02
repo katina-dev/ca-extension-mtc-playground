@@ -6,7 +6,11 @@
 #
 # For commercial licensing, contact sales@digicert.com.
 
-# MTC Bridge — Local Development Configuration
+# MTC Bridge — Local Standalone Configuration
+#
+# Runs the bridge with the local CA only — no DigiCert dependency. New certs
+# enter the Merkle tree via the ACME finalize handler. To re-enable DigiCert
+# CA polling, fill in the ca_db section and set MTC_CADB_HOST/USERNAME/PASSWORD.
 
 log:
   name: "mtc-bridge-dev"
@@ -24,13 +28,15 @@ state_db:
   max_idle_conns: 3
   conn_max_lifetime: 5m
 
+# CA database polling — disabled in standalone mode. Leave host empty to
+# skip the DigiCert MariaDB connection entirely.
 ca_db:
-  host: "${MTC_CADB_HOST:-localhost}"
+  host: "${MTC_CADB_HOST:-}"
   port: ${MTC_CADB_PORT:-3306}
   database: "${MTC_CADB_DATABASE:-digicert_ca}"
-  username: "${MTC_CADB_USERNAME}"
-  password: "${MTC_CADB_PASSWORD}"
-  issuer_id: ""  # all CAs
+  username: "${MTC_CADB_USERNAME:-}"
+  password: "${MTC_CADB_PASSWORD:-}"
+  issuer_id: ""
 
 http:
   addr: ":8080"
@@ -54,17 +60,13 @@ logging:
   format: "json"
 
 assertion_issuer:
-  # enabled: true  # default; set false to disable
   batch_size: 5000
   concurrency: 4
   staleness_threshold: 5
-  # webhooks:
-  #   - url: "https://example.com/mtc-webhook"
-  #     pattern: "*.example.com"
-  #     secret: "webhook-secret"
 
 local_ca:
   enabled: true
+  mtc_mode: true   # MTC-spec certs (id-alg-mtcProof). Set false for legacy embedded-extension mode.
   key_file: "${MTC_LOCAL_CA_KEY:-keys/local-ca.key}"
   cert_file: "${MTC_LOCAL_CA_CERT:-keys/local-ca.pem}"
   validity: 8760h    # 1 year
@@ -75,15 +77,16 @@ acme:
   enabled: true
   addr: ":8443"
   external_url: "https://localhost:8443"
-  ca_url: "${CA_URL:-http://localhost}"
-  ca_api_key: "${CA_API_KEY}"
+  # CA proxy fields below are only used when local_ca.enabled = false.
+  ca_url: "${CA_URL:-}"
+  ca_api_key: "${CA_API_KEY:-}"
   ca_id: "${CA_ID:-}"
   template_id: "${CA_TEMPLATE_ID:-}"
   mtc_bridge_url: "${MTC_BRIDGE_URL:-http://localhost:8080}"
   order_expiry: 24h
   assertion_timeout: 5m
   assertion_poll_interval: 5s
-  auto_approve_challenge: true  # skip http-01 for internal CA
+  auto_approve_challenge: true
 
-  tls_cert: "/etc/mtc-bridge/acme-cert.pem"
-  tls_key: "/etc/mtc-bridge/acme-key.pem"
+  tls_cert: "${MTC_ACME_TLS_CERT:-/etc/mtc-bridge/acme-cert.pem}"
+  tls_key: "${MTC_ACME_TLS_KEY:-/etc/mtc-bridge/acme-key.pem}"

@@ -110,14 +110,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Connect to CA MariaDB database.
-	caAdapter, err := cadb.New(ctx, cfg.CADB, logger.With("component", "cadb"))
-	if err != nil {
-		logger.Error("failed to connect to CA database", "error", err)
-		os.Exit(1)
+	// Connect to CA MariaDB database. Standalone mode (no DigiCert): if
+	// ca_db.host is empty we skip the adapter and the watcher's polling loops
+	// no-op. New certs still flow through acme/finalize.go → issuance log.
+	var caAdapter *cadb.Adapter
+	if cfg.CADB.Host != "" {
+		caAdapter, err = cadb.New(ctx, cfg.CADB, logger.With("component", "cadb"))
+		if err != nil {
+			logger.Error("failed to connect to CA database", "error", err)
+			os.Exit(1)
+		}
+		defer caAdapter.Close()
+		logger.Info("connected to CA database")
+	} else {
+		logger.Info("CA database disabled (standalone mode); only local-CA ACME issuance will populate the log")
 	}
-	defer caAdapter.Close()
-	logger.Info("connected to CA database")
 
 	// Initialize cosigner.
 	cs, err := cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
@@ -177,10 +184,12 @@ func main() {
 		"webhooks", len(issuerCfg.Webhooks),
 	)
 
-	// Build CA name map for admin visualization.
+	// Build CA name map for admin visualization. Empty in standalone mode.
 	caNameMap := make(map[string]string)
-	for _, ca := range caAdapter.GetCAs() {
-		caNameMap[ca.ID] = ca.Name
+	if caAdapter != nil {
+		for _, ca := range caAdapter.GetCAs() {
+			caNameMap[ca.ID] = ca.Name
+		}
 	}
 
 	// Create HTTP handlers.
