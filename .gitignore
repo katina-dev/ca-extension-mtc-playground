@@ -33,10 +33,14 @@ docker-compose.override.yml
 acme-cert.pem
 acme-key.pem
 
-# Compiled binaries (outside bin/)
-demo-embedded-cert
-mtc-bridge
-mtc-conformance
-mtc-tls-server
-mtc-tls-verify
-mtc-verify-cert
+# Compiled binaries (stray output from `go build ./cmd/<name>/` without -o,
+# which drops the artifact at the repo root). Leading / anchors each pattern
+# so they don't also match the cmd/<name>/ source directories.
+/demo-embedded-cert
+/mtc-bridge
+/mtc-conformance
+/mtc-assertion
+/mtc-interop
+/mtc-tls-server
+/mtc-tls-verify
+/mtc-verify-cert
