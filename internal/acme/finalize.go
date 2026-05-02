@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -299,9 +300,10 @@ func (srv *Server) processFinalizeMTC(ctx context.Context, orderID string, csr *
 		return
 	}
 
-	// Step 2: Wrap in MerkleTreeCertEntry and append to log.
-	serialHex := fmt.Sprintf("MTC-%s", orderID)
-	entry, err := issuancelog.BuildMTCEntry(logEntryDER, serialHex)
+	// Step 2: Wrap in MerkleTreeCertEntry and append to log. We don't know the
+	// leaf index until after append, so seed serial_hex with a placeholder and
+	// backfill the real value below.
+	entry, err := issuancelog.BuildMTCEntry(logEntryDER, "")
 	if err != nil {
 		srv.logger.Error("acme: MTC entry build failed", "order_id", orderID, "error", err)
 		srv.store.UpdateACMEOrderStatus(ctx, orderID, "invalid", map[string]interface{}{
@@ -319,6 +321,17 @@ func (srv *Server) processFinalizeMTC(ctx context.Context, orderID string, csr *
 			"error_detail": "log append failed: " + err.Error(),
 		})
 		return
+	}
+
+	// In MTC-spec mode the cert's X.509 serialNumber is the leaf index. Encode
+	// it the same way clients see it (big-endian, leading zeros stripped, hex)
+	// so /proof/inclusion?serial=<hex> lookups match.
+	serialHex := strings.ToUpper(hex.EncodeToString(big.NewInt(leafIdx).Bytes()))
+	if serialHex == "" {
+		serialHex = "00"
+	}
+	if err := srv.store.UpdateEntrySerial(ctx, leafIdx, serialHex); err != nil {
+		srv.logger.Warn("acme: backfill serial_hex failed", "order_id", orderID, "leaf_index", leafIdx, "error", err)
 	}
 
 	// Step 3: Create checkpoint and compute inclusion proof.

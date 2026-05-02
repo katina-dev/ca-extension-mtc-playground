@@ -258,6 +258,19 @@ func (s *Store) AppendEntry(ctx context.Context, entry *LogEntry) error {
 	return nil
 }
 
+// UpdateEntrySerial sets the serial_hex on an existing log entry. Used by MTC
+// finalize to backfill the cert's actual serial (the leaf index, hex-encoded)
+// after the entry has been appended.
+func (s *Store) UpdateEntrySerial(ctx context.Context, idx int64, serialHex string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE log_entries SET serial_hex = $1 WHERE idx = $2`, serialHex, idx,
+	)
+	if err != nil {
+		return fmt.Errorf("store.UpdateEntrySerial: %w", err)
+	}
+	return nil
+}
+
 // AppendEntries inserts multiple log entries in a single transaction.
 func (s *Store) AppendEntries(ctx context.Context, entries []*LogEntry) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1669,10 +1682,10 @@ func vizCAColor(name string) string {
 // by parsing DER certificates from log_entries that have no metadata yet.
 func (s *Store) PopulateCertMetadata(ctx context.Context, caNames map[string]string) (int64, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT le.idx, le.entry_data, le.ca_cert_id, le.created_at
+		`SELECT le.idx, le.entry_type, le.entry_data, le.ca_cert_id, le.created_at
 		 FROM log_entries le
 		 LEFT JOIN cert_metadata cm ON le.idx = cm.entry_idx
-		 WHERE le.entry_type = 1 AND cm.entry_idx IS NULL
+		 WHERE le.entry_type IN (1, 3) AND cm.entry_idx IS NULL
 		 ORDER BY le.idx
 		 LIMIT 1000`)
 	if err != nil {
@@ -1695,16 +1708,26 @@ func (s *Store) PopulateCertMetadata(ctx context.Context, caNames map[string]str
 	var pending []metaRow
 	for rows.Next() {
 		var idx int64
+		var entryType int16
 		var entryData []byte
 		var caCertID string
 		var createdAt time.Time
-		if err := rows.Scan(&idx, &entryData, &caCertID, &createdAt); err != nil {
+		if err := rows.Scan(&idx, &entryType, &entryData, &caCertID, &createdAt); err != nil {
 			return 0, fmt.Errorf("store.PopulateCertMetadata: scan: %w", err)
 		}
 
-		meta, _, err := certutil.ParseLogEntry(entryData)
+		var meta *certutil.CertMeta
+		switch entryType {
+		case 1: // legacy full X.509 cert
+			meta, _, err = certutil.ParseLogEntry(entryData)
+		case 3: // MTC TBSCertificateLogEntry
+			meta, err = certutil.ParseMTCLogEntry(entryData)
+		default:
+			s.logger.Warn("viz: skip entry type", "idx", idx, "type", entryType)
+			continue
+		}
 		if err != nil {
-			s.logger.Warn("viz: skip unparseable entry", "idx", idx, "error", err)
+			s.logger.Warn("viz: skip unparseable entry", "idx", idx, "type", entryType, "error", err)
 			continue
 		}
 

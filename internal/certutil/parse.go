@@ -14,10 +14,13 @@ package certutil
 
 import (
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
+
+	"crypto/x509/pkix"
 )
 
 // CertMeta holds human-readable metadata extracted from an X.509 certificate.
@@ -51,6 +54,133 @@ func ParseDER(der []byte) (*CertMeta, error) {
 		return nil, fmt.Errorf("certutil.ParseDER: %w", err)
 	}
 	return fromCert(cert), nil
+}
+
+// ParseMTCLogEntry extracts metadata from an MTC-spec log entry whose
+// entry_data is a TLS-presentation-language MerkleTreeCertEntry:
+//   - 2 bytes BE uint16 = MerkleTreeCertEntryType (1 = tbs_cert_entry)
+//   - 3 bytes BE uint24 = data length
+//   - N bytes = contents octets of TBSCertificateLogEntry DER (no SEQUENCE envelope)
+//
+// The TBSCertificateLogEntry omits serialNumber and replaces the full public
+// key with SHA-256(SPKI), so the returned CertMeta has no serial and an empty
+// SignatureAlgorithm (the cert's signature is the MTC inclusion proof).
+func ParseMTCLogEntry(entryData []byte) (*CertMeta, error) {
+	if len(entryData) < 5 {
+		return nil, fmt.Errorf("certutil.ParseMTCLogEntry: entry too short (%d bytes)", len(entryData))
+	}
+	entryType := uint16(entryData[0])<<8 | uint16(entryData[1])
+	if entryType != 1 {
+		return nil, fmt.Errorf("certutil.ParseMTCLogEntry: expected MerkleTreeCertEntry type 1 (tbs_cert_entry), got %d", entryType)
+	}
+	dataLen := int(entryData[2])<<16 | int(entryData[3])<<8 | int(entryData[4])
+	if 5+dataLen > len(entryData) {
+		return nil, fmt.Errorf("certutil.ParseMTCLogEntry: data length %d exceeds entry size", dataLen)
+	}
+	contents := entryData[5 : 5+dataLen]
+
+	// Re-wrap contents octets as a SEQUENCE so encoding/asn1 can parse it.
+	wrapped, err := asn1.Marshal(asn1.RawValue{
+		Tag: asn1.TagSequence, Class: asn1.ClassUniversal, IsCompound: true, Bytes: contents,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("certutil.ParseMTCLogEntry: wrap contents: %w", err)
+	}
+
+	type tbsValidity struct {
+		NotBefore time.Time
+		NotAfter  time.Time
+	}
+	type tbsLogEntry struct {
+		Version                   int              `asn1:"optional,explicit,tag:0,default:0"`
+		Issuer                    asn1.RawValue    `asn1:""`
+		Validity                  tbsValidity      `asn1:""`
+		Subject                   asn1.RawValue    `asn1:""`
+		SubjectPublicKeyAlgorithm asn1.RawValue    `asn1:""`
+		SubjectPublicKeyInfoHash  []byte           `asn1:""`
+		Extensions                []pkix.Extension `asn1:"optional,explicit,tag:3"`
+	}
+
+	var tbs tbsLogEntry
+	if _, err := asn1.Unmarshal(wrapped, &tbs); err != nil {
+		return nil, fmt.Errorf("certutil.ParseMTCLogEntry: unmarshal: %w", err)
+	}
+
+	subject, _ := unmarshalDN(tbs.Subject.FullBytes)
+	issuer, _ := unmarshalDN(tbs.Issuer.FullBytes)
+
+	meta := &CertMeta{
+		CommonName:         subject.CommonName,
+		Organization:       subject.Organization,
+		OrganizationalUnit: subject.OrganizationalUnit,
+		Country:            subject.Country,
+		Province:           subject.Province,
+		Locality:           subject.Locality,
+		IssuerCN:           issuer.CommonName,
+		IssuerOrganization: issuer.Organization,
+		NotBefore:          tbs.Validity.NotBefore,
+		NotAfter:           tbs.Validity.NotAfter,
+		KeyAlgorithm:       keyAlgorithmFromAlgID(tbs.SubjectPublicKeyAlgorithm.FullBytes),
+		SignatureAlgorithm: "id-alg-mtcProof",
+	}
+	for _, ext := range tbs.Extensions {
+		if ext.Id.Equal(asn1.ObjectIdentifier{2, 5, 29, 17}) { // subjectAltName
+			meta.SANs = append(meta.SANs, parseSANDNSNames(ext.Value)...)
+		}
+	}
+	return meta, nil
+}
+
+func unmarshalDN(der []byte) (pkix.Name, error) {
+	var rdns pkix.RDNSequence
+	if _, err := asn1.Unmarshal(der, &rdns); err != nil {
+		return pkix.Name{}, err
+	}
+	var n pkix.Name
+	n.FillFromRDNSequence(&rdns)
+	return n, nil
+}
+
+func keyAlgorithmFromAlgID(algIDDER []byte) string {
+	type algID struct {
+		OID        asn1.ObjectIdentifier
+		Parameters asn1.RawValue `asn1:"optional"`
+	}
+	var a algID
+	if _, err := asn1.Unmarshal(algIDDER, &a); err != nil {
+		return ""
+	}
+	switch {
+	case a.OID.Equal(asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}):
+		return "ECDSA"
+	case a.OID.Equal(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}):
+		return "RSA"
+	case a.OID.Equal(asn1.ObjectIdentifier{1, 3, 101, 112}):
+		return "Ed25519"
+	}
+	return a.OID.String()
+}
+
+func parseSANDNSNames(extValue []byte) []string {
+	var seq asn1.RawValue
+	if _, err := asn1.Unmarshal(extValue, &seq); err != nil {
+		return nil
+	}
+	var names []string
+	rest := seq.Bytes
+	for len(rest) > 0 {
+		var v asn1.RawValue
+		var err error
+		rest, err = asn1.Unmarshal(rest, &v)
+		if err != nil {
+			break
+		}
+		// dNSName is [2] IMPLICIT IA5String
+		if v.Class == asn1.ClassContextSpecific && v.Tag == 2 {
+			names = append(names, string(v.Bytes))
+		}
+	}
+	return names
 }
 
 // ParseLogEntry extracts the DER certificate from an MTC log entry and parses it.
