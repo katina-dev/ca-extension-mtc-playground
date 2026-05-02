@@ -7,10 +7,18 @@ A standalone Go service implementing
 per `draft-ietf-plants-merkle-tree-certs-01`. It supports **spec-compliant
 signatureless certificates** (`signatureAlgorithm = id-alg-mtcProof`), multi-cosigner
 subtree signing (Ed25519 + ML-DSA post-quantum), batch/landmark infrastructure,
-and a local ACME CA with two certificate modes. It can also extend a DigiCert
-Private CA by watching its MariaDB database for certificate issuances and
-revocations, constructing an append-only issuance log as a Merkle tree, and
-serving it via the [C2SP tlog-tiles](https://c2sp.org/tlog-tiles) HTTP protocol.
+and a local ACME CA with two certificate modes.
+
+The bridge runs in two modes:
+
+- **Standalone mode (default)** — uses the bundled local CA. ACME issuance,
+  the Merkle tree, the visualizer, and proof distribution all work end-to-end
+  with no external CA. New certs flow into the log directly via the ACME
+  finalize handler. Only PostgreSQL is required.
+- **DigiCert extension mode (optional)** — additionally watches a DigiCert
+  Private CA's MariaDB for certificate issuances and revocations, appending
+  them to the same append-only issuance log served via the
+  [C2SP tlog-tiles](https://c2sp.org/tlog-tiles) HTTP protocol.
 
 **Internal / experimental. Not for production use.**
 
@@ -87,28 +95,27 @@ X.509 extensions is also available for backward compatibility.
 ## Architecture
 
 ```
-┌─────────────────┐         ┌──────────────────┐
-│  DigiCert CA    │  read   │   mtc-bridge     │
-│  MariaDB 10.11  │◄────────│   (Go service)   │
-│  :3306          │         │                  │
-│  digicert_ca DB │         │  ┌─ watcher ──┐  │
-└─────────────────┘         │  │ poll every  │  │
-                            │  │ 10s for new │  │
-                            │  │ certs/revs  │  │
-                            │  └─────┬───────┘  │
-                            │        │          │
+                            ┌──────────────────┐
+                            │   mtc-bridge     │
+                            │   (Go service)   │
+                            │                  │
+┌─────────────────┐         │  ┌─ watcher ──┐  │
+│  DigiCert CA    │  read   │  │ poll every  │  │  (only runs when
+│  MariaDB 10.11  │◄────────│  │ 10s for new │  │   ca_db.host is set;
+│  :3306 (opt'l)  │         │  │ certs/revs  │  │   no-op in standalone)
+│  digicert_ca DB │         │  └─────┬───────┘  │
+└─────────────────┘         │        │          │
                             │  ┌─────▼───────┐  │
-                            │  │ issuancelog  │  │
-                            │  │ append entry │  │
+                            │  │ issuancelog  │◄─── ACME finalize
+                            │  │ append entry │   appends directly
                             │  │ update tree  │  │──► PostgreSQL State DB
                             │  │ checkpoint   │  │    (mtcbridge, :5432)
                             │  └─────┬───────┘  │
                             │        │          │
-                            │        │          │
                             │  ┌─────▼───────┐  │
                             │  │ assertion   │  │
                             │  │ issuer      │  │  On each checkpoint:
-                            │  │ (Phase 2)   │  │  batch-build bundles,
+                            │  │             │  │  batch-build bundles,
                             │  └─────┬───────┘  │  refresh stale proofs
                             │        │          │
                             │  ┌─────▼───────┐  │
@@ -116,36 +123,36 @@ X.509 extensions is also available for backward compatibility.
                             │  │ admin UI    │  │    /checkpoint, /tile/...
                             │  │ proofs      │  │    /proof/inclusion
                             │  │ assertions  │  │    /assertion/{query}
-                            │  │ polling     │  │    /assertions/pending
+                            │  │ visualizer  │  │    /admin/viz
                             │  └──────┬──────┘  │
-                            │         │         │
-                            │    ┌────▼────┐    │
-                            │    │webhooks │    │──► POST to configured URLs
-                            │    │(optional│    │   HMAC-SHA256 signed
-                            │    └────┬────┘    │
                             │         │         │
                             │  ┌──────▼──────┐  │
                             │  │ ACME server │  │──► HTTP :8443
-                            │  │ (Phase 3)   │  │    /acme/directory
-                            │  │ RFC 8555    │  │    /acme/new-account
-                            │  │ JWS verify  │──│──► DigiCert CA REST API
-                            │  │ CA proxy    │  │    (finalize → issue cert)
+                            │  │ RFC 8555    │  │    /acme/directory
+                            │  │ JWS verify  │  │    /acme/new-account
                             │  │             │  │
-                            │  │ ┌─ local CA─┤  │  Phase 5 (opt-in):
-                            │  │ │ 2-phase   │  │  Pre-cert → hash → re-sign
-                            │  │ │ signing   │  │  with MTC proof in X.509 ext
-                            │  │ └───────────┘  │
-                            │  └─────────────┘  │
+                            │  │ ┌─ local CA─┤  │  Standalone path:
+                            │  │ │ MTC-spec  │  │  ECDSA P-256 local CA
+                            │  │ │ or legacy │  │  → append to log directly
+                            │  │ └───────────┘  │  → return cert + proof
+                            │  │  ────or────    │
+                            │  │  CA proxy ────│──► DigiCert REST API
+                            │  └─────────────┘  │   (only when local_ca off)
                             └──────────────────┘
 ```
 
-**Data flow:** The watcher polls the DigiCert CA's MariaDB for new certificates
-and revocations. Each new certificate is appended to the Merkle tree in
-PostgreSQL. Checkpoints are signed with Ed25519 and served over HTTP alongside
-tile data and inclusion proofs. The ACME server (Phase 3) runs on a separate
-port and provides RFC 8555 certificate issuance — it proxies finalize requests
-to the DigiCert CA, then waits for the assertion issuer to build the inclusion
-proof bundle before delivering the certificate with its MTC proof.
+**Standalone data flow (default):** The ACME server accepts an order, the
+local CA issues the certificate, the issuance log appends the entry directly
+(`acme/finalize.go:184`), an immediate checkpoint is created, and the cert is
+returned with its MTC proof. The watcher's polling loops are no-ops when
+`ca_db.host` is empty.
+
+**DigiCert extension data flow (optional):** The watcher polls the DigiCert
+CA's MariaDB for new certificates and revocations and appends them to the
+same issuance log. Checkpoints are signed with Ed25519 and served over HTTP
+alongside tile data and inclusion proofs. The ACME server can be configured
+to proxy finalize requests to the DigiCert CA REST API instead of using the
+local CA.
 
 **Local CA — MTC-spec mode (primary):** When `local_ca.enabled = true` and
 `local_ca.mtc_mode = true`, the ACME server issues spec-compliant MTC
@@ -166,7 +173,23 @@ which auto-detects the certificate format.
 
 ## Prerequisites
 
-### DigiCert Private CA
+### Standalone mode (default)
+
+- **Docker Desktop** + **Docker Compose**, or **Go 1.21+** for local builds
+- **PostgreSQL 16** — provided by `docker-compose.yml` on port 5432, or any
+  reachable Postgres instance
+- `curl`, `openssl`, `python3` for the walkthrough commands
+- The bundled local CA (`keys/local-ca.pem`) — generated once with
+  `make generate-local-ca`. Clients must trust this root to validate the certs
+  the ACME server issues.
+
+No DigiCert CA, no MariaDB, no extra Docker network are needed for standalone
+mode.
+
+### DigiCert extension mode (optional)
+
+Only required if you want the bridge to additionally ingest certs from a
+DigiCert Private CA's database:
 
 - **DigiCert ONE Private CA** — a provisioned Private CA instance with:
   - **API Key** — REST API authentication key (from DigiCert ONE admin console)
@@ -178,92 +201,76 @@ which auto-detects the certificate format.
   - Default credentials: `<DB_USERNAME>`/`<DB_PASSWORD>` on port 3306
   - The CA database must be reachable on the `digicert-ca_default` Docker network
 
-### Infrastructure
+To enable: set `MTC_CADB_HOST`/`MTC_CADB_USERNAME`/`MTC_CADB_PASSWORD` in
+`.env`, fill in `acme.ca_*` fields in `config.yaml`, and add the
+`digicert-ca_default` external network to the `mtc-bridge` service in
+`docker-compose.yml`.
 
-- **Docker Desktop** and **Docker Compose** (for containerized deployment)
-- **Go 1.21+** (only if building locally outside Docker)
-- **PostgreSQL 16** — provided automatically by `docker-compose.yml` on port 5432
-- `curl`, `openssl`, `python3` for the walkthrough commands
+### Configuration variables
 
-### Network Setup
-
-The DigiCert CA database runs on a separate Docker network. Create it before
-running mtc-bridge if it doesn't already exist:
-
-```bash
-# Create the external network (if the CA isn't already running via Docker Compose)
-docker network create digicert-ca_default
-```
-
-mtc-bridge connects to **two networks**: `mtc-internal` (PostgreSQL) and
-`digicert-ca_default` (MariaDB CA database).
-
-### Required Configuration
-
-Copy `.env.example` to `.env` and fill in your DigiCert credentials:
-
-```bash
-cp .env.example .env
-```
-
-| Variable | Description | Example |
+| Variable | Required when | Description |
 |---|---|---|
-| `CA_API_KEY` | DigiCert REST API key | `abc123...` |
-| `CA_ID` | Issuing CA identifier | `A76AC522CBABC804919211EB5706CFAD` |
-| `CA_TEMPLATE_ID` | Certificate template ID | `0196198F96545084143B237D9E39FC90` |
-| `CA_URL` | CA API base URL | `http://digicert-ca:8080` |
-| `MTC_CADB_HOST` | MariaDB hostname | `ca-db` |
-| `MTC_CADB_PASSWORD` | MariaDB password | *(required)* |
-
-### Optional: Local CA Mode
-
-For local certificate issuance (no DigiCert CA dependency):
-
-```bash
-make generate-local-ca    # generates keys/local-ca.key + keys/local-ca.pem
-```
-
-Then set `local_ca.enabled: true` in `config.yaml`. For **MTC-spec certificates**
-(recommended), also set `local_ca.mtc_mode: true`. Clients must trust the local
-CA root certificate (`keys/local-ca.pem`).
+| `MTC_POSTGRES_PASSWORD` | always (default `mtcbridge`) | Postgres state DB password |
+| `MTC_LOCAL_CA_KEY` / `MTC_LOCAL_CA_CERT` | local CA enabled (default) | Local CA key/cert paths |
+| `MTC_COSIGNER_KEY_FILE` | always | Ed25519 cosigner key path |
+| `MTC_CADB_HOST` / `MTC_CADB_USERNAME` / `MTC_CADB_PASSWORD` | DigiCert mode only | MariaDB connection |
+| `CA_API_KEY` / `CA_ID` / `CA_TEMPLATE_ID` / `CA_URL` | DigiCert proxy mode (`local_ca.enabled = false`) | DigiCert REST API |
 
 ---
 
 ## Quick Start
+
+The shipped `config.yaml` and `docker-compose.yml` default to **standalone
+mode** (local CA, no DigiCert dependency). If you only want to read about MTC
+mechanics and don't need a running server, jump straight to
+[the standalone CLI demo](#mtc-spec-compliant-certificate-demo-primary)
+(`make demo-mtc`) — it has no infrastructure requirements at all.
+
+### Standalone (local CA only)
 
 ```bash
 # 1. Clone the repo
 git clone https://github.com/briantrzupek/ca-extension-merkle.git
 cd ca-extension-merkle
 
-# 2. Build
+# 2. Build the binaries
 make build
 
-# 3. Generate a cosigner key (first time only)
+# 3. Generate the cosigner Ed25519 key (one-time)
 make generate-key
 
-# 4. Configure environment (copy and edit .env with your CA credentials)
-cp .env.example .env
-# Edit .env with your DigiCert CA API key, CA ID, and template ID
+# 4. Generate the local CA key + self-signed cert (one-time)
+make generate-local-ca
 
-# 5. Generate self-signed TLS certs for the ACME server
+# 5. Generate a self-signed TLS cert for the ACME server (one-time)
 ./gen-demo-cert.sh
 
-# 6. (Optional) Generate local CA for MTC-spec certificate mode
-make generate-local-ca
-# Then set local_ca.enabled: true and local_ca.mtc_mode: true in config.yaml
-
-# 7. Start all services via Docker Compose
+# 6. Start the bridge + Postgres
 docker compose up -d
-
-# Or run locally (requires PostgreSQL on localhost:5432):
+# Or, with Postgres already running on localhost:5432:
 make run
-# Or: ./bin/mtc-bridge -config config.yaml
 ```
 
-The service starts on `http://localhost:8080`. It will immediately begin
-ingesting certificates from the CA database and building the Merkle tree.
-The ACME server starts on `https://localhost:8443` (TLS with self-signed cert).
+The bridge starts on `http://localhost:8080` and the ACME server on
+`https://localhost:8443` (self-signed TLS). The Merkle tree starts empty
+(only the null entry at index 0) and grows as certs are issued via ACME.
+
+### DigiCert extension mode (optional)
+
+```bash
+# In addition to steps 1–5 above:
+cp .env.example .env
+# Edit .env: set CA_API_KEY, CA_ID, CA_TEMPLATE_ID, CA_URL, MTC_CADB_*
+
+# Edit config.yaml: fill in ca_db.host (or set MTC_CADB_HOST in .env)
+# Edit docker-compose.yml: re-add the `digicert-ca_default` external network
+# to the mtc-bridge service block
+
+docker compose up -d
+```
+
+The watcher will start polling the DigiCert MariaDB every 10 seconds and
+appending new certs into the same Merkle tree.
 
 ---
 
@@ -400,11 +407,13 @@ for details.
 - **JWS verification** uses only Go stdlib (ES256/RS256), no external JOSE libraries.
 - **Account management** via JWK thumbprint (RFC 7638).
 - **Order lifecycle**: pending → ready → processing → valid, with http-01 challenge validation (auto-approve for internal CAs).
-- **CA proxy**: Finalize requests are proxied to DigiCert CA REST API; assertion bundles are polled and attached to certificate downloads.
+- **Issuance backend**: Local CA (default) appends entries directly to the
+  Merkle tree via `acme/finalize.go`. Optional CA proxy mode forwards finalize
+  requests to the DigiCert REST API and polls for the assertion bundle.
 - **In-memory nonce store** with TTL cleanup.
 - **Database**: 4 new ACME tables, 6 indexes, ~16 CRUD methods.
 - **Config**: `ACMEConfig` with 12 fields, sensible defaults.
-- **Conformance**: 6 ACME tests + 3 MTC-spec tests + 3 consistency proof tests (29 total), all passing — including full MTC flow with real CA.
+- **Conformance**: 6 ACME tests + 3 MTC-spec tests + 3 consistency proof tests (29 total), all passing — exercising the full ACME → local CA → Merkle tree pipeline.
 
 ### How to Demonstrate
 
@@ -418,10 +427,9 @@ for details.
 
    Or use Docker Compose for reproducible setup:
    ```bash
-   cp .env.example .env   # edit with your CA credentials
    ./gen-demo-cert.sh     # generate self-signed TLS certs
    docker compose up -d
-   docker compose logs -f acme-server
+   docker compose logs -f mtc-bridge
    ```
    - Main API: `http://localhost:8080`
    - ACME API: `https://localhost:8443`
@@ -452,7 +460,8 @@ for details.
    - Create order (JWS POST to `/acme/new-order`)
    - Get authorization and challenge
    - Trigger challenge validation (auto-approved in dev mode)
-   - Finalize order (proxy CSR to DigiCert CA)
+   - Finalize order — local CA signs and appends to the Merkle tree (or proxy
+     to DigiCert if `local_ca.enabled = false`)
    - Download certificate + assertion bundle (PEM)
    - See `.ai/phase3-acme-server.md` for full technical details and API examples.
 
@@ -584,6 +593,7 @@ docker compose up -d
 ```yaml
 local_ca:
   enabled: true
+  mtc_mode: false      # true = MTC-spec certs (id-alg-mtcProof); false = legacy embedded extension
   key_file: "keys/local-ca.key"
   cert_file: "keys/local-ca.pem"
   validity: 8760h      # 1 year default cert validity
@@ -591,9 +601,12 @@ local_ca:
   country: "US"
 ```
 
-When `local_ca.enabled` is `true`, the ACME server uses the local CA for
-two-phase signing instead of proxying to DigiCert. Both modes can coexist
-(toggle via config). Clients must trust the local CA's root certificate.
+When `local_ca.enabled` is `true`, the ACME server uses the local CA. With
+`mtc_mode: false` it uses the legacy two-phase signing flow (proof in a custom
+X.509 extension); with `mtc_mode: true` it produces spec-compliant
+`id-alg-mtcProof` certificates. When `local_ca.enabled` is `false`, the ACME
+server proxies finalize requests to DigiCert. Clients must trust the local
+CA's root certificate.
 
 ### Verifying a Certificate
 
@@ -698,15 +711,85 @@ open http://localhost:8080/admin/viz
 
 ---
 
-## Hands-On Walkthrough
+## Hands-On Walkthrough — Standalone (local CA)
 
-This section provides step-by-step commands you can run to issue a certificate
-through the DigiCert Private CA, watch mtc-bridge detect it, verify its
-inclusion in the Merkle tree, revoke it, and confirm the revocation is tracked.
+The fastest way to see the full lifecycle without DigiCert. Assumes the bridge
+is running per the [Quick Start](#quick-start) (`docker compose up -d` or
+`make run`) with `local_ca.enabled: true` and `local_ca.mtc_mode: true`.
+
+### S1 — Inspect the empty tree
+
+```bash
+curl -s http://localhost:8080/checkpoint
+# localhost/mtc-bridge
+# 1
+# <root hash, base64>
+#
+# — mtc-bridge-dev <signature>
+```
+
+A fresh tree has size `1` (the spec-required null entry at index 0).
+
+### S2 — Issue a cert via ACME
+
+The conformance tool drives the full RFC 8555 flow against the local CA — it's
+the simplest way to issue a real cert because writing JWS by hand is tedious:
+
+```bash
+./bin/mtc-conformance \
+  -url http://localhost:8080 \
+  -acme-url https://localhost:8443 \
+  -verbose
+```
+
+This runs 29 tests including the complete order → authorize → finalize flow.
+Each successful order appends an entry to the Merkle tree.
+
+### S3 — Watch the tree grow + browse
+
+```bash
+curl -s http://localhost:8080/checkpoint        # tree_size has incremented
+open http://localhost:8080/admin/viz            # sunburst / treemap / proof explorer
+open http://localhost:8080/admin/               # certificate browser
+```
+
+### S4 — Verify a cert offline
+
+Certs issued by the local CA in MTC-spec mode have `signatureAlgorithm =
+id-alg-mtcProof` and the inclusion proof embedded in `signatureValue`. Verify
+without contacting the bridge:
+
+```bash
+./bin/mtc-verify-cert -cert <cert.pem>
+```
+
+To additionally compare against the live checkpoint (catches forks):
+
+```bash
+./bin/mtc-verify-cert -cert <cert.pem> -bridge-url http://localhost:8080
+```
+
+### S5 — Standalone TLS handshake
+
+Pick any cert from the tree and serve it with stapled assertion:
+
+```bash
+./bin/mtc-tls-server -cert cert.pem -key key.pem -bridge-url http://localhost:8080 &
+./bin/mtc-tls-verify -url https://localhost:4443 -insecure
+```
+
+---
+
+## Hands-On Walkthrough — DigiCert mode
+
+This section provides step-by-step commands to issue a certificate through a
+DigiCert Private CA, watch mtc-bridge detect it, verify its inclusion in the
+Merkle tree, revoke it, and confirm the revocation is tracked.
 
 > **Note:** All commands below assume the DigiCert CA is running on
-> `localhost:80` and mtc-bridge is running on `localhost:8080`. Adjust the
-> `CA_API_KEY`, `CA_ID`, and `TEMPLATE_ID` values for your environment.
+> `localhost:80` and mtc-bridge is running on `localhost:8080` with
+> [DigiCert extension mode](#digicert-extension-mode-optional) configured.
+> Adjust `CA_API_KEY`, `CA_ID`, and `TEMPLATE_ID` for your environment.
 
 ### Step 0 — Set Variables
 
@@ -1325,9 +1408,12 @@ Makefile               Build, test, run, conformance, demo-mtc, demo-embedded ta
 See [config.yaml](config.yaml) for the full configuration reference. Key
 sections:
 
-- **`state_db`** — PostgreSQL connection for the Merkle tree state
-- **`ca_db`** — MariaDB connection for the DigiCert CA database (read-only)
-- **`watcher`** — Polling intervals for certificates and revocations
+- **`state_db`** — PostgreSQL connection for the Merkle tree state (required)
+- **`ca_db`** — MariaDB connection for the DigiCert CA database (read-only).
+  Leave `host` empty (default) to run in **standalone mode** — the watcher's
+  polling loops become no-ops and only ACME-issued certs populate the tree.
+- **`watcher`** — Polling intervals for certificates and revocations (only
+  active when `ca_db.host` is set)
 - **`cosigner`** — Primary cosigner: key file, key ID, algorithm (`ed25519`, `mldsa44`, `mldsa65`, `mldsa87`), cosigner_id
 - **`additional_cosigners`** — Additional cosigners for multi-cosigner subtree signing
 - **`batch`** — Batch processing: enabled, window duration, min_size
@@ -1503,25 +1589,52 @@ For questions about the CLA, contact [opensourcelegal@digicert.com](mailto:opens
 ## Fully Automated End-to-End Demo
 
 This project provides a scriptable, reproducible demo of the complete ACME-to-MTC pipeline:
-ACME certificate request → DigiCert CA issuance → Merkle tree ingestion → assertion proof
-generation → certificate download with MTC assertion bundle attached.
+ACME certificate request → certificate issuance (local CA or DigiCert) → Merkle tree
+ingestion → assertion proof generation → certificate download with MTC assertion bundle.
 
-### Prerequisites
-- Fill in your secrets and config values in `.env` (copy from `.env.example`)
-- Ensure Docker and Docker Compose are installed
-- DigiCert Private CA and MariaDB available on the Docker network (see docker-compose.yml)
-
-### Environment Variables (`.env`)
+### Standalone (default) — no DigiCert needed
 
 ```bash
-# Required — DigiCert Private CA credentials
+make generate-key
+make generate-local-ca
+./gen-demo-cert.sh
+docker compose up -d                                # postgres + mtc-bridge + ACME on :8443
+docker compose ps                                   # all containers should be "Up"
+curl -s http://localhost:8080/healthz               # {"status":"ok"}
+curl -sk https://localhost:8443/acme/directory | python3 -m json.tool
+
+make build
+./bin/mtc-conformance -url http://localhost:8080 -acme-url https://localhost:8443 -verbose
+```
+
+The conformance suite drives the full ACME order → local-CA issuance → Merkle
+append → assertion bundle pipeline.
+
+### DigiCert extension mode
+
+In addition to the standalone steps:
+
+```bash
+cp .env.example .env
+# Set: CA_API_KEY, CA_ID, CA_TEMPLATE_ID, CA_URL,
+#      MTC_CADB_HOST, MTC_CADB_USERNAME, MTC_CADB_PASSWORD
+```
+
+Then re-add the `digicert-ca_default` external network to the `mtc-bridge`
+service in `docker-compose.yml` (the standalone compose file omits it). You
+can also run `./demo-e2e.sh` for the full end-to-end script.
+
+### Environment variables (`.env`)
+
+```bash
+# Always required (defaults shown)
+MTC_POSTGRES_PASSWORD=mtcbridge
+
+# DigiCert extension mode only
 CA_API_KEY=your-api-key-here
 CA_ID=your-ca-id-here
 CA_TEMPLATE_ID=your-template-id-here
-CA_URL=http://digicert-ca:8080     # Docker service name
-
-# Database credentials (defaults usually work)
-MTC_POSTGRES_PASSWORD=mtcbridge
+CA_URL=http://digicert-ca:8080
 MTC_CADB_HOST=ca-db
 MTC_CADB_PORT=3306
 MTC_CADB_USERNAME=<your-db-username>
@@ -1529,42 +1642,17 @@ MTC_CADB_PASSWORD=<your-db-password>
 MTC_CADB_DATABASE=digicert_ca
 ```
 
-### Steps
-1. Generate demo TLS certs for the ACME server:
-   ```bash
-   ./gen-demo-cert.sh
-   ```
-2. Start all services:
-   ```bash
-   docker compose up -d
-   ```
-3. Verify everything is healthy:
-   ```bash
-   docker compose ps          # all containers should be "Up"
-   curl -s http://localhost:8080/healthz  # {"status":"ok"}
-   curl -sk https://localhost:8443/acme/directory | python3 -m json.tool
-   ```
-4. Run the conformance suite (includes full MTC flow):
-   ```bash
-   make build
-   ./bin/mtc-conformance -url http://localhost:8080 -acme-url https://localhost:8443 -verbose
-   ```
-   All 29 tests pass, including `acme_full_mtc_flow` which exercises the complete pipeline.
-5. Or run the end-to-end demo script:
-   ```bash
-   ./demo-e2e.sh
-   ```
-
 ### Docker Deployment Notes
 
-The Docker Compose setup runs three containers:
+The standalone Docker Compose setup runs two containers:
 - **postgres** — PostgreSQL 16 state store for the Merkle tree
-- **mtc-bridge** — main service (watcher, tree builder, assertion issuer, HTTP API on :8080)
-- **acme-server** — ACME server (RFC 8555 on :8443 with TLS)
+- **mtc-bridge** — single binary serving the main HTTP API on `:8080` and the
+  ACME server on `:8443` (TLS) in one process
 
-Configuration uses environment variable substitution (`${VAR:-default}` in config.yaml),
-so the same config file works for both local development and Docker deployment. Docker
-services communicate via Docker DNS names (e.g., `postgres`, `digicert-ca`, `ca-db`).
+Configuration uses environment variable substitution (`${VAR:-default}` in
+config.yaml), so the same config file works for both local development and
+Docker deployment. Docker services communicate via Docker DNS names (e.g.,
+`postgres`).
 
 ### What the Full MTC Flow Demonstrates
 
