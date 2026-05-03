@@ -713,25 +713,26 @@ open http://localhost:8080/admin/viz
 
 ## Post-Quantum Cosigner
 
-The bridge can sign every Merkle tree checkpoint (and every MTC subtree)
-with a post-quantum signature scheme instead of Ed25519. Useful for
-demonstrating PQ readiness end-to-end: client → ACME → Merkle tree →
-checkpoint signed with **ML-DSA** (FIPS 204).
+The bridge can sign every Merkle tree **checkpoint** with a post-quantum
+signature scheme instead of Ed25519. Useful for demonstrating PQ readiness
+at the log-tree-head level: a client that pins the checkpoint validates it
+against an **ML-DSA** (FIPS 204) signature today, future-proofing the log
+identity against a quantum attacker — without touching the rest of the PKI.
 
 ### What's actually post-quantum
 
 | Component | Algorithm | Library | Status |
 |---|---|---|---|
-| **Cosigner** (signs checkpoints + subtrees) | Ed25519 / ML-DSA-44 / ML-DSA-65 / ML-DSA-87 | Go stdlib / cloudflare/circl | **Configurable today** |
-| MTC subtree signatures (MTC §5.4.1) | Same as cosigner | — | Inherits cosigner alg |
+| **Cosigner** (signs checkpoints) | Ed25519 / ML-DSA-44 / ML-DSA-65 / ML-DSA-87 | Go stdlib / cloudflare/circl | **Configurable today** |
+| MTC subtree signatures in `MTCProof.Signatures` (§5.4) | — | — | **Not produced** — see Limitations |
 | ACME JWS (account auth) | ECDSA P-256 (ES256) per RFC 8555 | Go stdlib | Spec-fixed; not PQ |
 | Local CA root signing key | ECDSA P-256 | Go stdlib | Not yet PQ-configurable |
 | Cert subject keys (in CSRs) | RSA / ECDSA / Ed25519 | Go stdlib | Not yet PQ; needs custom CSR path |
 
-So setting `cosigner.algorithm: mldsa65` gives you a **fully PQ-signed
-issuance log** today. The cert's chain of trust still has classical
-components (CA root, ACME auth, subject keys) — those are the next
-incremental steps.
+So setting `cosigner.algorithm: mldsa65` gives you a **PQ-signed checkpoint**
+today — the tree-head can be pinned post-quantum. Per-cert MTC subtree
+signatures, the local-CA root, the ACME handshake, and cert subject keys
+all remain classical. Those are the next incremental steps.
 
 ### Cryptography provenance
 
@@ -808,15 +809,27 @@ NIST-recommended balance and roughly the same level as RSA-3072 / ECDSA-P256.
 
 - Only the **primary** cosigner is currently config-driven. The
   `additional_cosigners` field in `config.yaml` is parsed but not yet
-  wired into the issuance log — multi-cosigner subtrees (one Ed25519
-  alongside one ML-DSA, the typical hybrid migration pattern) are a
-  future enhancement.
+  wired into the issuance log — multi-cosigner checkpoints (one Ed25519
+  alongside one ML-DSA, the typical hybrid PQ migration pattern) would be
+  the next addition.
+- **MTC subtree signatures** (`MTCProof.Signatures`, MTC §5.4) are NOT
+  produced by the bridge. Every issued cert ships in **signatureless mode**
+  (verifiers use landmark root-hash verification per §5.6). This is
+  deliberate: the spec's signed mode amortizes one cosigner signature
+  across an entire batch of certs that share a subtree. The bridge's
+  `acme/finalize.go` flow finalizes one cert per immediate checkpoint
+  (so the proof can return synchronously inside the ACME handshake), which
+  would force one set of signatures per cert — defeating the spec's
+  amortization model. Implementing signed mode "correctly" requires
+  switching to deferred-batch finalize, which is a larger change.
+  `Cosigner.SignSubtreeMTC` exists at the type level for whoever does
+  that work; the `internal/batch/` package is a half-finished start.
 - The ACME JWS handshake is locked to ES256 by RFC 8555 — clients still
   authenticate with classical ECDSA. The cosigner change doesn't affect
   ACME at all.
 - `mtc-verify-cert` and the conformance suite already handle ML-DSA
-  cosigner signatures because they go through the same `cosigner.Verify`
-  path. No changes needed on the verifier side.
+  cosigner signatures (they go through the same `cosigner.Verify` path).
+  No changes needed on the verifier side.
 
 ---
 
