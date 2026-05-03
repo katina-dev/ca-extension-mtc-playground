@@ -274,6 +274,77 @@ appending new certs into the same Merkle tree.
 
 ---
 
+## Operational Reference
+
+A tight quick-reference once the bridge is up. The deeper walkthroughs
+([standalone S1–S6](#hands-on-walkthrough--standalone-local-ca),
+[DigiCert mode](#hands-on-walkthrough--digicert-mode)) cover what each
+command does step-by-step; this section is the cheatsheet you come back to.
+
+### Sanity checks after `docker compose up -d`
+
+```bash
+docker compose ps                        # postgres + mtc-bridge "Up"
+curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/checkpoint   # tree_size = 1 (just the null entry)
+docker compose logs --tail=30 mtc-bridge | grep -iE 'cosigner|http server starting|acme server'
+```
+
+### Issuing certs — three options
+
+Pick whichever fits the moment. All three append entries to the same
+Merkle tree.
+
+| Path | Speed | What you see | Command |
+|---|---|---|---|
+| **Bulk** | fastest | per-cert log lines + summary | `./bin/bulk-issue -count 25 -concurrency 4 -insecure -verbose` |
+| **Conformance suite** | medium | 29 tests, validates wire format | `./bin/mtc-conformance -url http://localhost:8080 -acme-url https://localhost:8443 -verbose` |
+| **Browser ACME demo** | slowest, most visual | step-by-step UI of the 16 ACME steps | `open http://localhost:8080/admin/acme-demo` |
+
+After any of these, refresh `http://localhost:8080/admin/viz` — the
+sunburst/treemap fills with the new certs.
+
+### Useful URLs
+
+| URL | What |
+|---|---|
+| `http://localhost:8080/admin/` | Dashboard (overview + cert browser) |
+| `http://localhost:8080/admin/viz` | Visualizer (sunburst, treemap, proof explorer) |
+| `http://localhost:8080/admin/acme-demo` | Step-by-step ACME walkthrough in the browser |
+| `http://localhost:8080/checkpoint` | Current signed tree-head |
+| `http://localhost:8080/proof/inclusion?index=N` | Inclusion proof for leaf index N |
+| `http://localhost:8080/proof/consistency?old=M&new=N` | Consistency proof between tree sizes M and N |
+| `https://localhost:8443/acme/directory` | ACME directory (use `curl -k` — self-signed TLS) |
+
+### Verify a cert offline
+
+```bash
+# Pull the most recently issued cert out of Postgres:
+docker compose exec postgres psql -U mtcbridge -At -c \
+  "SELECT encode(final_cert_der, 'base64') FROM acme_orders \
+   WHERE final_cert_der IS NOT NULL ORDER BY id DESC LIMIT 1" \
+  | base64 -d > /tmp/latest.der
+
+openssl x509 -in /tmp/latest.der -inform DER -out /tmp/latest.pem -noout -text   # inspect
+./bin/mtc-verify-cert -cert /tmp/latest.pem                                       # offline verify
+./bin/mtc-verify-cert -cert /tmp/latest.pem -bridge-url http://localhost:8080     # + checkpoint compare
+```
+
+### Restart / reset cheatsheet
+
+| Goal | Command |
+|---|---|
+| Restart bridge after code change | `docker compose up -d --build --force-recreate mtc-bridge` |
+| Tail bridge logs | `docker compose logs -f mtc-bridge` |
+| Stop everything | `docker compose down` |
+| **Wipe Postgres + start fresh tree** | `docker compose down -v && docker compose up -d --build` |
+| Rebuild local binaries (no Docker) | `make build` (drops in `bin/`) |
+| Regenerate ACME server TLS cert | `./gen-demo-cert.sh` (then restart bridge) |
+
+Add `sudo` to `docker compose ...` if your user isn't in the `docker` group.
+
+---
+
 ## MTC Spec-Compliant Certificate Demo (Primary)
 
 This is the recommended demo path. It generates a spec-compliant MTC certificate
@@ -745,7 +816,7 @@ never roll our own crypto:
 - Randomness → `crypto/rand.Reader` (Go stdlib, OS CSPRNG)
 - Ed25519 → Go stdlib `crypto/ed25519` (RFC 8032)
 
-### Setup
+### Setup (local binary, not Docker)
 
 ```bash
 # 1. Generate an ML-DSA-65 cosigner key. Replaces keys/cosigner.key in place.
@@ -755,21 +826,45 @@ make generate-key-mldsa65
 ./bin/mtc-bridge -generate-key keys/cosigner.key -algorithm mldsa65
 # Algorithms: ed25519 (default), mldsa44, mldsa65, mldsa87
 
-# 2. Tell the bridge which algorithm the key is. Either edit config.yaml:
-#    cosigner:
-#      algorithm: mldsa65
-# Or set the env var (overrides config.yaml):
+# 2. Tell the bridge which algorithm the key is — env var (overrides config.yaml):
 export MTC_COSIGNER_ALGORITHM=mldsa65
+# Or edit config.yaml:
+#   cosigner:
+#     algorithm: mldsa65
 
-# 3. Restart the bridge to pick up the new key + algorithm.
-docker compose up -d --build --force-recreate mtc-bridge
-# Or local:
+# 3. Restart locally
 make run
+```
+
+### Setup (Docker — the keys/ dir is volume-mounted, owned by root)
+
+`make generate-key-mldsa65` runs the binary on your host and may hit
+permission errors if `keys/cosigner.key` was created by Docker (root-owned).
+Run the generator inside the container instead so file ownership stays
+consistent:
+
+```bash
+# 1. Stop the bridge so it releases the key file
+docker compose stop mtc-bridge
+
+# 2. Regenerate the key from inside the container (path is the in-container path)
+docker compose run --rm mtc-bridge \
+  -generate-key /etc/mtc-bridge/keys/cosigner.key -algorithm mldsa65
+
+# 3. Set the algorithm via .env so it survives compose recreate
+echo 'MTC_COSIGNER_ALGORITHM=mldsa65' >> .env
+
+# 4. Restart with the new env
+docker compose up -d --build --force-recreate mtc-bridge
 ```
 
 **Important:** the algorithm setting must match the key file. An Ed25519
 PEM loaded as ML-DSA (or vice versa) fails at startup with an "unpack"
 error from circl. Switching algorithms requires regenerating the key.
+
+To switch back to Ed25519: regenerate with `-algorithm ed25519` and either
+remove the `MTC_COSIGNER_ALGORITHM` line from `.env` (default is ed25519)
+or set it to `ed25519` explicitly.
 
 ### Verify it worked
 
