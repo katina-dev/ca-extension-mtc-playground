@@ -6,7 +6,7 @@
 #
 # For commercial licensing, contact sales@digicert.com.
 
-.PHONY: build test vet lint clean run generate-key generate-local-ca conformance interop demo-tls demo-embedded demo-mtc docker docker-up docker-down help
+.PHONY: build test vet lint clean run generate-key generate-local-ca conformance interop demo-tls demo-embedded demo-mtc bulk-issue docker docker-up docker-down help
 
 # Default target
 help:
@@ -24,6 +24,7 @@ help:
 	@echo "  demo-tls         Run TLS assertion stapling demo (requires running bridge + CA)"
 	@echo "  demo-embedded    Run embedded MTC proof demo (standalone, no server needed)"
 	@echo "  demo-mtc         Run MTC-spec cert demo (id-alg-mtcProof, standalone)"
+	@echo "  bulk-issue       Issue N certs through ACME (default 10) — populates the visualizer"
 	@echo "  docker           Build Docker image"
 	@echo "  docker-up        Start all services via docker compose"
 	@echo "  docker-down      Stop all services"
@@ -40,7 +41,8 @@ build:
 	go build -o bin/mtc-verify-cert ./cmd/mtc-verify-cert/
 	go build -o bin/demo-embedded-cert ./cmd/demo-embedded-cert/
 	go build -o bin/mtc-interop ./cmd/mtc-interop/
-	@echo "Built: bin/mtc-bridge, bin/mtc-conformance, bin/mtc-assertion, bin/mtc-tls-server, bin/mtc-tls-verify, bin/mtc-verify-cert, bin/demo-embedded-cert, bin/mtc-interop"
+	go build -o bin/bulk-issue ./cmd/bulk-issue/
+	@echo "Built: bin/mtc-bridge, bin/mtc-conformance, bin/mtc-assertion, bin/mtc-tls-server, bin/mtc-tls-verify, bin/mtc-verify-cert, bin/demo-embedded-cert, bin/mtc-interop, bin/bulk-issue"
 
 # Test
 test:
@@ -103,6 +105,13 @@ demo-mtc: build
 	@echo ""
 	./bin/mtc-verify-cert -cert /tmp/mtc-spec-cert.pem
 	@rm -f /tmp/mtc-spec-cert.pem /tmp/mtc-spec-cert.key
+
+# Bulk issue N certs through the ACME endpoint. Override defaults with:
+#   make bulk-issue COUNT=100 CONCURRENCY=8
+COUNT ?= 10
+CONCURRENCY ?= 4
+bulk-issue: build
+	./bin/bulk-issue -count $(COUNT) -concurrency $(CONCURRENCY) -verbose
 
 # Docker
 docker:

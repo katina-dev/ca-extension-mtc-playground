@@ -778,6 +778,43 @@ Pick any cert from the tree and serve it with stapled assertion:
 ./bin/mtc-tls-verify -url https://localhost:4443 -insecure
 ```
 
+### S6 — Bulk-issue many certs
+
+The conformance suite issues a handful of certs as a side effect, but to
+populate the visualizer with realistic data — or to stress-test the issuance
+log — use `bulk-issue`. It runs the full ACME order → finalize → download
+flow N times against the local CA, reusing one ACME account across orders.
+
+```bash
+make build
+make bulk-issue                          # default: 10 certs, 4 in parallel
+make bulk-issue COUNT=100 CONCURRENCY=8  # 100 certs, 8 parallel workers
+```
+
+Or call the binary directly for more control:
+
+```bash
+./bin/bulk-issue \
+  -acme-url https://localhost:8443 \
+  -count 250 \
+  -concurrency 16 \
+  -domain-prefix loadtest \
+  -insecure \
+  -verbose
+```
+
+Each issued cert appends one entry to the Merkle tree (leaf index = X.509
+serial in MTC mode). On a typical laptop you'll see ~10–30 cert/s. After a
+bulk run, refresh `http://localhost:8080/admin/viz` to see the sunburst /
+treemap update, and try a consistency proof:
+
+```bash
+curl -s 'http://localhost:8080/proof/consistency?old=10&new=110' | python3 -m json.tool
+```
+
+Domains are generated as `<prefix>-<runID>-<i>.example.com` so back-to-back
+runs don't collide.
+
 ---
 
 ## Hands-On Walkthrough — DigiCert mode
@@ -1372,6 +1409,7 @@ cmd/
   mtc-tls-verify/      TLS verification client — auto-detects MTC-spec vs legacy certs
   mtc-verify-cert/     Verify certificates offline (MTC-spec id-alg-mtcProof + legacy extension)
   demo-embedded-cert/  Standalone demo: generates MTC-spec or legacy certs (--mtc-mode flag)
+  bulk-issue/          Loop ACME order/finalize/download N times — populate the visualizer / stress-test the log
 internal/
   acme/                RFC 8555 ACME server (JWS, nonce, accounts, orders, challenges, CA proxy + local CA)
   admin/               HTMX dashboard + certificate browser + visualization explorer
