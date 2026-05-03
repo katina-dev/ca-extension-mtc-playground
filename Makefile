@@ -6,7 +6,7 @@
 #
 # For commercial licensing, contact sales@digicert.com.
 
-.PHONY: build test vet lint clean run generate-key generate-local-ca conformance interop demo-tls demo-embedded demo-mtc bulk-issue docker docker-up docker-down help
+.PHONY: build test vet lint clean run generate-key generate-key-mldsa65 generate-local-ca conformance interop demo-tls demo-embedded demo-mtc bulk-issue docker docker-up docker-down help
 
 # Default target
 help:
@@ -17,7 +17,8 @@ help:
 	@echo "  vet              Run go vet"
 	@echo "  clean            Remove build artifacts"
 	@echo "  run              Run mtc-bridge locally"
-	@echo "  generate-key     Generate a new Ed25519 signing key"
+	@echo "  generate-key     Generate a new Ed25519 cosigner signing key"
+	@echo "  generate-key-mldsa65 Generate a new ML-DSA-65 (post-quantum) cosigner signing key"
 	@echo "  generate-local-ca Generate a self-signed local CA key + cert for embedded proofs"
 	@echo "  conformance      Run conformance test suite against a running server"
 	@echo "  interop          Cross-validate against bwesterb/mtc reference implementation"
@@ -61,10 +62,18 @@ clean:
 run: build
 	./bin/mtc-bridge -config config.yaml
 
-# Generate signing key
+# Generate Ed25519 cosigner key (default classical signing scheme).
 generate-key: build
 	@mkdir -p keys
 	./bin/mtc-bridge -generate-key keys/cosigner.key
+
+# Generate an ML-DSA-65 cosigner key for post-quantum demo.
+# After running this you must also set `cosigner.algorithm: mldsa65` in
+# config.yaml (or export MTC_COSIGNER_ALGORITHM=mldsa65) and restart the
+# bridge — see README "Post-Quantum Cosigner" for the full workflow.
+generate-key-mldsa65: build
+	@mkdir -p keys
+	./bin/mtc-bridge -generate-key keys/cosigner.key -algorithm mldsa65
 
 # Generate local CA key + cert for embedded proof mode
 generate-local-ca: build

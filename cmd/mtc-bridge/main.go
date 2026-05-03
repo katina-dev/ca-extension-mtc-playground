@@ -40,20 +40,35 @@ import (
 
 func main() {
 	configFile := flag.String("config", "config.yaml", "path to configuration file")
-	generateKey := flag.String("generate-key", "", "generate a new Ed25519 key and exit")
+	generateKey := flag.String("generate-key", "", "generate a new cosigner key and exit (use -algorithm to choose; defaults to ed25519)")
+	generateAlgorithm := flag.String("algorithm", "ed25519", "cosigner key algorithm: ed25519, mldsa44, mldsa65, mldsa87 (used with -generate-key)")
 	generateLocalCA := flag.Bool("generate-local-ca", false, "generate a self-signed local CA key + cert and exit")
 	flag.Parse()
 
-	// Key generation mode.
+	// Key generation mode. Dispatches on -algorithm so the same flag works for
+	// both classical (Ed25519) and post-quantum (ML-DSA) cosigner keys. All
+	// keygen primitives come from vetted libraries (Go stdlib for Ed25519,
+	// cloudflare/circl for ML-DSA — see internal/cosigner/cosigner.go for the
+	// rationale and audit info).
 	if *generateKey != "" {
-		pub, err := cosigner.GenerateKey(*generateKey)
+		alg, err := cosigner.ParseAlgorithm(*generateAlgorithm)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v (valid: ed25519, mldsa44, mldsa65, mldsa87)\n", err)
+			os.Exit(1)
+		}
+		pub, err := cosigner.Generate(*generateKey, alg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Generated Ed25519 key pair.\n")
+		fmt.Printf("Generated %s key pair.\n", alg)
 		fmt.Printf("Public key (hex): %x\n", pub)
+		fmt.Printf("Public key length: %d bytes\n", len(pub))
 		fmt.Printf("Private key saved to: %s\n", *generateKey)
+		// Reminder: keyHash in the signed-note checkpoint format is computed
+		// from (keyID, pubkey). Switching algorithms on the same keyID without
+		// regenerating the key, or vice versa, will invalidate previously-
+		// signed checkpoints — verifiers won't recognise the new keyHash.
 		return
 	}
 
@@ -126,18 +141,39 @@ func main() {
 		logger.Info("CA database disabled (standalone mode); only local-CA ACME issuance will populate the log")
 	}
 
-	// Initialize cosigner.
-	cs, err := cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
+	// Initialize the primary cosigner. The signing algorithm comes from
+	// cfg.Cosigner.Algorithm — Ed25519 by default, but can be ML-DSA-44/65/87
+	// for a fully post-quantum tree-head signature. See cosigner.Load for the
+	// per-algorithm dispatch and the comment on LoadConfig for what each
+	// algorithm gives you. ML-DSA support uses cloudflare/circl (audited),
+	// Ed25519 uses Go stdlib.
+	//
+	// IMPORTANT: the key file at cfg.Cosigner.KeyFile must match the chosen
+	// algorithm. An Ed25519 PEM loaded as ML-DSA (or vice versa) will fail
+	// at Load with an "unpack" error — regenerate with -generate-key
+	// -algorithm <alg> if you change cfg.Cosigner.Algorithm.
+	cosignerAlg, err := cosigner.ParseAlgorithm(cfg.Cosigner.Algorithm)
 	if err != nil {
-		logger.Error("failed to initialize cosigner", "error", err)
+		logger.Error("invalid cosigner algorithm", "configured", cfg.Cosigner.Algorithm, "error", err)
 		os.Exit(1)
 	}
-	// Set the cosigner's TrustAnchorID from the log origin.
-	cs.SetCosignerID([]byte(cfg.Log.Origin))
+	cs, err := cosigner.Load(cosigner.LoadConfig{
+		KeyFile:    cfg.Cosigner.KeyFile,
+		KeyID:      cfg.Cosigner.KeyID,
+		Origin:     cfg.Log.Origin,
+		Algorithm:  cosignerAlg,
+		CosignerID: []byte(cfg.Log.Origin), // TrustAnchorID for MTCSignature (MTC §5.4)
+	})
+	if err != nil {
+		logger.Error("failed to initialize cosigner", "algorithm", cosignerAlg, "key_file", cfg.Cosigner.KeyFile, "error", err)
+		os.Exit(1)
+	}
 	logger.Info("cosigner initialized",
 		"key_id", cs.KeyID(),
+		"algorithm", cs.Algorithm().String(),
 		"origin", cs.Origin(),
 		"public_key", cs.PublicKeyHex(),
+		"public_key_bytes", len(cs.PublicKeyBytes()),
 	)
 
 	// Create issuance log.

@@ -86,8 +86,81 @@ type Cosigner struct {
 	cosignerID []byte // TrustAnchorID for MTCSignature (variable-length)
 }
 
+// LoadConfig configures Load. It mirrors the YAML shape in config.yaml so the
+// caller can pass cfg.Cosigner directly (after string→SignatureAlgorithm
+// parsing).
+//
+// Algorithm selects the signing scheme:
+//   - AlgEd25519 (default): classical Edwards-curve signatures, RFC 8032,
+//     Go stdlib crypto/ed25519. Small keys (32 B), small signatures (64 B).
+//   - AlgMLDSA44/65/87: post-quantum lattice signatures, FIPS 204. Provided
+//     by cloudflare/circl, which is third-party-audited and is the same
+//     library the cosigner.NewMLDSA path uses.
+//
+// CosignerID is the TrustAnchorID emitted in MTCSignature blobs (MTC §5.4).
+// Required for ML-DSA cosigners that participate in subtree signing; may be
+// nil for an Ed25519 checkpoint-only cosigner (Load will not auto-set it).
+type LoadConfig struct {
+	KeyFile    string
+	KeyID      string
+	Origin     string
+	Algorithm  SignatureAlgorithm
+	CosignerID []byte
+}
+
+// Load constructs a Cosigner from the given config, dispatching to the right
+// per-algorithm loader. This is the front door wiring used by cmd/mtc-bridge:
+// it lets the YAML-configured `cosigner.algorithm` field flow through to the
+// correct circl-backed implementation without callers having to branch.
+//
+// Existing callers that hard-code Ed25519 (tests, legacy paths) can keep
+// using New() or NewFromSeed() unchanged.
+func Load(cfg LoadConfig) (*Cosigner, error) {
+	switch cfg.Algorithm {
+	case AlgEd25519:
+		c, err := New(cfg.KeyFile, cfg.KeyID, cfg.Origin)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.CosignerID != nil {
+			c.SetCosignerID(cfg.CosignerID)
+		}
+		return c, nil
+	case AlgMLDSA44, AlgMLDSA65, AlgMLDSA87:
+		// NewMLDSA already requires cosignerID; accept nil and let it through
+		// — callers without a TrustAnchorID can still get an MLDSA cosigner
+		// for checkpoint-only use, then call SetCosignerID later if needed.
+		return NewMLDSA(cfg.KeyFile, cfg.Algorithm, cfg.KeyID, cfg.Origin, cfg.CosignerID)
+	default:
+		return nil, fmt.Errorf("cosigner.Load: unsupported algorithm %s", cfg.Algorithm)
+	}
+}
+
+// Generate creates a new key pair for the requested algorithm and writes the
+// private key to keyFile. Returns the packed public-key bytes (Ed25519: 32 B
+// raw; ML-DSA: circl's MarshalBinary output, sized per FIPS 204).
+//
+// All randomness comes from crypto/rand.Reader — never roll our own RNG.
+//   - Ed25519 keygen: Go stdlib crypto/ed25519.GenerateKey
+//   - ML-DSA keygen: cloudflare/circl/sign/mldsa/mldsa{44,65,87}.GenerateKey
+func Generate(keyFile string, algorithm SignatureAlgorithm) ([]byte, error) {
+	switch algorithm {
+	case AlgEd25519:
+		pub, err := GenerateKey(keyFile)
+		if err != nil {
+			return nil, err
+		}
+		return pub, nil
+	case AlgMLDSA44, AlgMLDSA65, AlgMLDSA87:
+		return GenerateMLDSAKey(keyFile, algorithm)
+	default:
+		return nil, fmt.Errorf("cosigner.Generate: unsupported algorithm %s", algorithm)
+	}
+}
+
 // New creates a Cosigner from a PEM-encoded Ed25519 private key file.
 // This is the backward-compatible constructor. For ML-DSA keys, use NewMLDSA.
+// New callers should prefer Load() so the algorithm is config-driven.
 func New(keyFile, keyID, origin string) (*Cosigner, error) {
 	data, err := os.ReadFile(keyFile)
 	if err != nil {

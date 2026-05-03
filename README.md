@@ -711,6 +711,115 @@ open http://localhost:8080/admin/viz
 
 ---
 
+## Post-Quantum Cosigner
+
+The bridge can sign every Merkle tree checkpoint (and every MTC subtree)
+with a post-quantum signature scheme instead of Ed25519. Useful for
+demonstrating PQ readiness end-to-end: client → ACME → Merkle tree →
+checkpoint signed with **ML-DSA** (FIPS 204).
+
+### What's actually post-quantum
+
+| Component | Algorithm | Library | Status |
+|---|---|---|---|
+| **Cosigner** (signs checkpoints + subtrees) | Ed25519 / ML-DSA-44 / ML-DSA-65 / ML-DSA-87 | Go stdlib / cloudflare/circl | **Configurable today** |
+| MTC subtree signatures (MTC §5.4.1) | Same as cosigner | — | Inherits cosigner alg |
+| ACME JWS (account auth) | ECDSA P-256 (ES256) per RFC 8555 | Go stdlib | Spec-fixed; not PQ |
+| Local CA root signing key | ECDSA P-256 | Go stdlib | Not yet PQ-configurable |
+| Cert subject keys (in CSRs) | RSA / ECDSA / Ed25519 | Go stdlib | Not yet PQ; needs custom CSR path |
+
+So setting `cosigner.algorithm: mldsa65` gives you a **fully PQ-signed
+issuance log** today. The cert's chain of trust still has classical
+components (CA root, ACME auth, subject keys) — those are the next
+incremental steps.
+
+### Cryptography provenance
+
+All PQ primitives come from
+[`cloudflare/circl`](https://github.com/cloudflare/circl) v1.6.3, which is
+audited (NCC Group) and used in Cloudflare's production Go services. We
+never roll our own crypto:
+
+- ML-DSA keygen / sign / verify → `circl/sign/mldsa/mldsa{44,65,87}` (FIPS 204)
+- Randomness → `crypto/rand.Reader` (Go stdlib, OS CSPRNG)
+- Ed25519 → Go stdlib `crypto/ed25519` (RFC 8032)
+
+### Setup
+
+```bash
+# 1. Generate an ML-DSA-65 cosigner key. Replaces keys/cosigner.key in place.
+make generate-key-mldsa65
+
+# Or manually with explicit algorithm:
+./bin/mtc-bridge -generate-key keys/cosigner.key -algorithm mldsa65
+# Algorithms: ed25519 (default), mldsa44, mldsa65, mldsa87
+
+# 2. Tell the bridge which algorithm the key is. Either edit config.yaml:
+#    cosigner:
+#      algorithm: mldsa65
+# Or set the env var (overrides config.yaml):
+export MTC_COSIGNER_ALGORITHM=mldsa65
+
+# 3. Restart the bridge to pick up the new key + algorithm.
+docker compose up -d --build --force-recreate mtc-bridge
+# Or local:
+make run
+```
+
+**Important:** the algorithm setting must match the key file. An Ed25519
+PEM loaded as ML-DSA (or vice versa) fails at startup with an "unpack"
+error from circl. Switching algorithms requires regenerating the key.
+
+### Verify it worked
+
+The startup log line shows the algorithm and pubkey size:
+
+```bash
+docker compose logs mtc-bridge | grep "cosigner initialized"
+# {"msg":"cosigner initialized","algorithm":"mldsa65","public_key_bytes":1952,...}
+```
+
+A wrong-algorithm key will fail to load:
+
+```
+{"msg":"failed to initialize cosigner","algorithm":"mldsa65","error":"cosigner.NewMLDSA: unpack mldsa65 key: ..."}
+```
+
+You can also inspect a checkpoint signature size — ML-DSA-65 checkpoint
+signatures are ~3.3 KB versus Ed25519's 64 B:
+
+```bash
+curl -s http://localhost:8080/checkpoint | tail -1 | wc -c
+```
+
+### Algorithm tradeoffs
+
+| Algorithm | Pubkey | Signature | NIST level | Notes |
+|---|---|---|---|---|
+| Ed25519 | 32 B | 64 B | — (classical, broken by Shor's) | Default; smallest, fastest |
+| ML-DSA-44 | 1312 B | 2420 B | 2 | PQ, smallest |
+| ML-DSA-65 | 1952 B | 3293 B | 3 | PQ, recommended balance |
+| ML-DSA-87 | 2592 B | 4595 B | 5 | PQ, highest assurance |
+
+For a learning playground, **ML-DSA-65** is the obvious pick — it's the
+NIST-recommended balance and roughly the same level as RSA-3072 / ECDSA-P256.
+
+### Limitations
+
+- Only the **primary** cosigner is currently config-driven. The
+  `additional_cosigners` field in `config.yaml` is parsed but not yet
+  wired into the issuance log — multi-cosigner subtrees (one Ed25519
+  alongside one ML-DSA, the typical hybrid migration pattern) are a
+  future enhancement.
+- The ACME JWS handshake is locked to ES256 by RFC 8555 — clients still
+  authenticate with classical ECDSA. The cosigner change doesn't affect
+  ACME at all.
+- `mtc-verify-cert` and the conformance suite already handle ML-DSA
+  cosigner signatures because they go through the same `cosigner.Verify`
+  path. No changes needed on the verifier side.
+
+---
+
 ## Hands-On Walkthrough — Standalone (local CA)
 
 The fastest way to see the full lifecycle without DigiCert. Assumes the bridge
