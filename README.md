@@ -300,9 +300,16 @@ Merkle tree.
 | **Bulk** | fastest | per-cert log lines + summary | `./bin/bulk-issue -count 25 -concurrency 4 -insecure -verbose` |
 | **Conformance suite** | medium | 29 tests, validates wire format | `./bin/mtc-conformance -url http://localhost:8080 -acme-url https://localhost:8443 -verbose` |
 | **Browser ACME demo** | slowest, most visual | step-by-step UI of the 16 ACME steps | `open http://localhost:8080/admin/acme-demo` |
+| **Cert-size report** | medium | CSV of cert/SPKI/proof bytes per algorithm | `make cert-size-report COUNT_PER_ALGO=10 OUTPUT=sizes.csv` |
 
 After any of these, refresh `http://localhost:8080/admin/viz` — the
 sunburst/treemap fills with the new certs.
+
+`cert-size-report` is the only path that issues certs with **post-quantum
+subject keys** (ML-DSA-44/65/87 via cloudflare/circl). Useful for measuring
+wire-size overhead before deploying. See
+[Post-Quantum Subject Keys](#post-quantum-subject-keys) and
+[`docs/design/wire-size-experiment.md`](docs/design/wire-size-experiment.md).
 
 ### Useful URLs
 
@@ -899,6 +906,37 @@ curl -s http://localhost:8080/checkpoint | tail -1 | wc -c
 
 For a learning playground, **ML-DSA-65** is the obvious pick — it's the
 NIST-recommended balance and roughly the same level as RSA-3072 / ECDSA-P256.
+
+### Post-Quantum Subject Keys
+
+Beyond the cosigner, the bridge can also issue certs whose **subject public
+key** is post-quantum. In MTC mode the leaf cert's `SubjectPublicKeyInfo`
+is treated as opaque bytes — it's copied verbatim from the CSR into the
+leaf cert and never interpreted by the bridge. So any algorithm openssl 3.5+
+or cloudflare/circl can produce a CSR for will flow through end-to-end.
+
+Supported via `cert-size-report`:
+
+| Algorithm | OID (RFC 9881) | SPKI bytes | Typical leaf cert size |
+|---|---|---|---|
+| Ed25519 | (classical) | 44 | ~480 |
+| ECDSA-P256 | (classical) | 91 | ~560 |
+| RSA-2048 | (classical) | 294 | ~760 |
+| ML-DSA-44 | 2.16.840.1.101.3.4.3.17 | 1334 | ~1830 |
+| **ML-DSA-65** | 2.16.840.1.101.3.4.3.18 | 1974 | **~2440** |
+| ML-DSA-87 | 2.16.840.1.101.3.4.3.19 | 2614 | ~3110 |
+
+Numbers measured at tree size ~110 in signatureless mode; proof contribution
+is independent of subject algorithm.
+
+The CSR parser at `internal/acme/csrparse.go` is permissive: it falls back
+to a manual ASN.1 walk if a future Go version tightens stdlib's SPKI
+acceptance. CSR self-signatures are not verified by the bridge (matches
+stdlib behavior — domain control is established by ACME challenges).
+
+To verify the chain end-to-end with PQ subject keys, the verifier doesn't
+need any code changes — `mtc-verify-cert` walks the inclusion proof over
+opaque cert bytes regardless of subject algorithm.
 
 ### Limitations
 
@@ -1627,6 +1665,7 @@ cmd/
   mtc-verify-cert/     Verify certificates offline (MTC-spec id-alg-mtcProof + legacy extension)
   demo-embedded-cert/  Standalone demo: generates MTC-spec or legacy certs (--mtc-mode flag)
   bulk-issue/          Loop ACME order/finalize/download N times — populate the visualizer / stress-test the log
+  cert-size-report/    Issue certs across a matrix of subject-key algorithms (incl. ML-DSA-{44,65,87}) and write a CSV of cert/SPKI/proof byte sizes
 internal/
   acme/                RFC 8555 ACME server (JWS, nonce, accounts, orders, challenges, CA proxy + local CA)
   admin/               HTMX dashboard + certificate browser + visualization explorer
@@ -1648,7 +1687,10 @@ internal/
   watcher/             CA database poller (certs + revocations)
 docs/
   adr/                 Architecture Decision Records (ADR-000 through ADR-008)
-  design/              System overview documentation
+  design/              System overview + forward-looking design notes:
+                         - system-overview.md
+                         - wolfssl-cgo-shim.md       (packaging the verifier as a C-callable .so)
+                         - wire-size-experiment.md   (PQ-vs-classical wire-size methodology)
 keys/                  Ed25519/ML-DSA cosigner keys + local CA key/cert (generated, not committed)
 config.yaml            Local development configuration
 docker-compose.yml     Docker Compose for mtc-bridge + PostgreSQL
