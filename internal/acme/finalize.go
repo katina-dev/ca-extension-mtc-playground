@@ -64,7 +64,10 @@ func (srv *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 		acmeError(w, http.StatusBadRequest, "badCSR", "invalid CSR encoding")
 		return
 	}
-	csr, err := x509.ParseCertificateRequest(csrDER)
+	// ParseCSRPermissive falls back to manual ASN.1 walking when the SPKI
+	// algorithm OID is unknown to stdlib (e.g. ML-DSA). MTC mode treats SPKI
+	// as opaque bytes, so this lets PQ subject keys flow through end-to-end.
+	csr, err := ParseCSRPermissive(csrDER)
 	if err != nil {
 		acmeError(w, http.StatusBadRequest, "badCSR", "invalid CSR: "+err.Error())
 		return
