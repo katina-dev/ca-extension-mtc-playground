@@ -6,7 +6,7 @@
 #
 # For commercial licensing, contact sales@digicert.com.
 
-.PHONY: build test vet lint clean run generate-key generate-key-mldsa65 generate-local-ca conformance interop demo-tls demo-embedded demo-mtc bulk-issue docker docker-up docker-down help
+.PHONY: build test vet lint clean run generate-key generate-key-mldsa65 generate-local-ca conformance interop demo-tls demo-embedded demo-mtc bulk-issue cert-size-report docker docker-up docker-down help
 
 # Default target
 help:
@@ -26,6 +26,7 @@ help:
 	@echo "  demo-embedded    Run embedded MTC proof demo (standalone, no server needed)"
 	@echo "  demo-mtc         Run MTC-spec cert demo (id-alg-mtcProof, standalone)"
 	@echo "  bulk-issue       Issue N certs through ACME (default 10) — populates the visualizer"
+	@echo "  cert-size-report Measure cert sizes across subject-key algorithms (writes CSV)"
 	@echo "  docker           Build Docker image"
 	@echo "  docker-up        Start all services via docker compose"
 	@echo "  docker-down      Stop all services"
@@ -43,7 +44,8 @@ build:
 	go build -o bin/demo-embedded-cert ./cmd/demo-embedded-cert/
 	go build -o bin/mtc-interop ./cmd/mtc-interop/
 	go build -o bin/bulk-issue ./cmd/bulk-issue/
-	@echo "Built: bin/mtc-bridge, bin/mtc-conformance, bin/mtc-assertion, bin/mtc-tls-server, bin/mtc-tls-verify, bin/mtc-verify-cert, bin/demo-embedded-cert, bin/mtc-interop, bin/bulk-issue"
+	go build -o bin/cert-size-report ./cmd/cert-size-report/
+	@echo "Built: bin/mtc-bridge, bin/mtc-conformance, bin/mtc-assertion, bin/mtc-tls-server, bin/mtc-tls-verify, bin/mtc-verify-cert, bin/demo-embedded-cert, bin/mtc-interop, bin/bulk-issue, bin/cert-size-report"
 
 # Test
 test:
@@ -121,6 +123,14 @@ COUNT ?= 10
 CONCURRENCY ?= 4
 bulk-issue: build
 	./bin/bulk-issue -count $(COUNT) -concurrency $(CONCURRENCY) -verbose
+
+# Cert-size measurement: issues N certs per subject-key algorithm, writes CSV.
+# Override with COUNT_PER_ALGO=10 ALGOS=ed25519,mldsa65 OUTPUT=sizes.csv
+COUNT_PER_ALGO ?= 3
+ALGOS ?= ed25519,ecdsa256,rsa2048,mldsa44,mldsa65,mldsa87
+OUTPUT ?= cert-sizes.csv
+cert-size-report: build
+	./bin/cert-size-report -count-per-algo $(COUNT_PER_ALGO) -algorithms $(ALGOS) -output $(OUTPUT) -verbose
 
 # Docker
 docker:

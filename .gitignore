@@ -44,3 +44,9 @@ acme-key.pem
 /mtc-tls-server
 /mtc-tls-verify
 /mtc-verify-cert
+/cert-size-report
+/bulk-issue
+
+# Session exports (user-generated, not part of the project history)
+/last-session-*.txt
+/2*-*-*-*.txt
